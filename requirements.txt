@@ -1,6 +1,9 @@
 # Core
 numpy
 opencv-python
+torch
+torchvision
+Pillow
 
 # YOLO training/export
 ultralytics
