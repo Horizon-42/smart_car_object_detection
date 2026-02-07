@@ -235,8 +235,16 @@ class OnnxYoloDetector:
         if providers is None:
             providers = ort.get_available_providers()
         self.session = ort.InferenceSession(str(self.model_path), providers=providers)
-        self.input_name = self.session.get_inputs()[0].name
+        actual_providers = self.session.get_providers()
+        print(
+            "ONNX Runtime providers (requested -> actual): "
+            f"{providers} -> {actual_providers}"
+        )
+        input_meta = self.session.get_inputs()[0]
+        self.input_name = input_meta.name
         self.input_size = self._resolve_input_size(input_size)
+        self.input_dtype = self._resolve_input_dtype(input_meta)
+        self._scale = np.array(1.0 / 255.0, dtype=self.input_dtype)
         self.last_inference_time = None
 
     def _resolve_input_size(self, input_size):
@@ -247,12 +255,20 @@ class OnnxYoloDetector:
             return (shape[2], shape[3])
         return 640
 
+    def _resolve_input_dtype(self, input_meta):
+        ort_type = getattr(input_meta, "type", "")
+        if "float16" in str(ort_type):
+            return np.float16
+        return np.float32
+
     def preprocess(self, image_bgr):
         image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         resized, ratio, pad = _letterbox(image, self.input_size)
-        blob = resized.astype(np.float32) / 255.0
+        blob = resized.astype(self.input_dtype, copy=False)
+        blob *= self._scale
         blob = np.transpose(blob, (2, 0, 1))
         blob = np.expand_dims(blob, axis=0)
+        blob = np.ascontiguousarray(blob)
         return blob, ratio, pad
 
     def predict(self, image_bgr, conf_thres=None, iou_thres=None, measure_time=False):
@@ -421,7 +437,9 @@ def run_inference_on_path(
                 else float("inf")
             )
             print(f"{img_path.name}: inference {inf_ms:.2f} ms | fps {fps:.2f}")
-        vis = detector.visualize(image, detections)
+        vis = None
+        if save_dir is not None or show:
+            vis = detector.visualize(image, detections)
 
         if save_dir is not None:
             out_path = save_dir / img_path.name
