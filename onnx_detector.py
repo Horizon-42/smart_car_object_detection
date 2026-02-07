@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 import sys
+import time
 
 import cv2
 import numpy as np
@@ -236,6 +237,7 @@ class OnnxYoloDetector:
         self.session = ort.InferenceSession(str(self.model_path), providers=providers)
         self.input_name = self.session.get_inputs()[0].name
         self.input_size = self._resolve_input_size(input_size)
+        self.last_inference_time = None
 
     def _resolve_input_size(self, input_size):
         if input_size is not None:
@@ -253,12 +255,19 @@ class OnnxYoloDetector:
         blob = np.expand_dims(blob, axis=0)
         return blob, ratio, pad
 
-    def predict(self, image_bgr, conf_thres=None, iou_thres=None):
+    def predict(self, image_bgr, conf_thres=None, iou_thres=None, measure_time=False):
         conf_thres = self.conf_thres if conf_thres is None else conf_thres
         iou_thres = self.iou_thres if iou_thres is None else iou_thres
 
         blob, ratio, pad = self.preprocess(image_bgr)
-        outputs = self.session.run(None, {self.input_name: blob})
+        if measure_time:
+            start = time.perf_counter()
+            outputs = self.session.run(None, {self.input_name: blob})
+            end = time.perf_counter()
+            self.last_inference_time = end - start
+        else:
+            outputs = self.session.run(None, {self.input_name: blob})
+            self.last_inference_time = None
         preds = _normalize_output(outputs)
 
         num_classes = len(self.class_names) if self.class_names else None
@@ -342,6 +351,7 @@ def run_inference_on_path(
     providers=None,
     save_dir=None,
     show=False,
+    measure_time=False,
 ):
     detector = OnnxYoloDetector(
         model_path,
@@ -364,7 +374,15 @@ def run_inference_on_path(
         image = cv2.imread(str(img_path))
         if image is None:
             continue
-        detections = detector.predict(image)
+        detections = detector.predict(image, measure_time=measure_time)
+        if measure_time and detector.last_inference_time is not None:
+            inf_ms = detector.last_inference_time * 1000.0
+            fps = (
+                1.0 / detector.last_inference_time
+                if detector.last_inference_time > 0
+                else float("inf")
+            )
+            print(f"{img_path.name}: inference {inf_ms:.2f} ms | fps {fps:.2f}")
         vis = detector.visualize(image, detections)
 
         if save_dir is not None:
@@ -412,6 +430,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--show", action="store_true", help="Show images in a window.")
     parser.add_argument("--no-save", action="store_true", help="Do not save outputs.")
+    parser.add_argument(
+        "--measure-time",
+        action="store_true",
+        help="Print inference time and FPS for each image.",
+    )
 
     args = parser.parse_args()
 
@@ -444,4 +467,5 @@ if __name__ == "__main__":
         providers=args.provider,
         save_dir=save_dir,
         show=args.show,
+        measure_time=args.measure_time,
     )
