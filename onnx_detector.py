@@ -341,6 +341,44 @@ def _collect_images(path):
     return []
 
 
+def _build_trt_providers(
+    enable_trt,
+    trt_fp16=False,
+    trt_cache_path=None,
+    trt_workspace_mb=None,
+    cuda_device_id=0,
+    extra_providers=None,
+):
+    if not enable_trt:
+        return extra_providers
+
+    trt_options = {}
+    if trt_fp16:
+        trt_options["trt_fp16_enable"] = True
+    if trt_cache_path:
+        cache_dir = Path(trt_cache_path)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        trt_options["trt_engine_cache_enable"] = True
+        trt_options["trt_engine_cache_path"] = str(cache_dir)
+    if trt_workspace_mb is not None:
+        trt_options["trt_max_workspace_size"] = int(trt_workspace_mb) * 1024 * 1024
+
+    providers = [
+        ("TensorrtExecutionProvider", trt_options),
+        ("CUDAExecutionProvider", {"device_id": int(cuda_device_id)}),
+    ]
+
+    if extra_providers:
+        existing = {p[0] if isinstance(p, (list, tuple)) else p for p in providers}
+        for provider in extra_providers:
+            name = provider[0] if isinstance(provider, (list, tuple)) else provider
+            if name not in existing:
+                providers.append(provider)
+                existing.add(name)
+
+    return providers
+
+
 def run_inference_on_path(
     model_path,
     image_path,
@@ -435,6 +473,33 @@ if __name__ == "__main__":
         action="store_true",
         help="Print inference time and FPS for each image.",
     )
+    parser.add_argument(
+        "--tensorrt",
+        action="store_true",
+        help="Enable TensorRT EP (with CUDA fallback).",
+    )
+    parser.add_argument(
+        "--trt-fp16",
+        action="store_true",
+        help="Enable TensorRT FP16 mode.",
+    )
+    parser.add_argument(
+        "--trt-cache",
+        default=None,
+        help="TensorRT engine cache directory.",
+    )
+    parser.add_argument(
+        "--trt-workspace-mb",
+        type=int,
+        default=None,
+        help="TensorRT max workspace size in MB.",
+    )
+    parser.add_argument(
+        "--cuda-device-id",
+        type=int,
+        default=0,
+        help="CUDA device id for TensorRT/CUDA EP.",
+    )
 
     args = parser.parse_args()
 
@@ -457,6 +522,15 @@ if __name__ == "__main__":
     target = args.image or args.folder
     save_dir = None if args.no_save else args.save_dir
 
+    providers = _build_trt_providers(
+        enable_trt=args.tensorrt,
+        trt_fp16=args.trt_fp16,
+        trt_cache_path=args.trt_cache,
+        trt_workspace_mb=args.trt_workspace_mb,
+        cuda_device_id=args.cuda_device_id,
+        extra_providers=args.provider,
+    )
+
     run_inference_on_path(
         args.model,
         target,
@@ -464,7 +538,7 @@ if __name__ == "__main__":
         conf=args.conf,
         iou=args.iou,
         imgsz=imgsz,
-        providers=args.provider,
+        providers=providers,
         save_dir=save_dir,
         show=args.show,
         measure_time=args.measure_time,
