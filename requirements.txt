@@ -1,0 +1,16 @@
+# Core
+numpy
+opencv-python
+
+# YOLO training/export
+ultralytics
+
+# Progress bars in pre_labeling.py
+# (Optional but recommended)
+tqdm
+
+# ONNX inference
+onnxruntime
+
+# Matplotlib is only needed if you run the demo notebook
+matplotlib
