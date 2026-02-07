@@ -234,12 +234,39 @@ class OnnxYoloDetector:
 
         if providers is None:
             providers = ort.get_available_providers()
+
+        # Ensure TRT cache directory exists when requested.
+        for provider in providers:
+            if isinstance(provider, (list, tuple)) and provider:
+                name = provider[0]
+                options = provider[1] if len(provider) > 1 else None
+                if (
+                    name == "TensorrtExecutionProvider"
+                    and isinstance(options, dict)
+                    and options.get("trt_engine_cache_path")
+                ):
+                    Path(options["trt_engine_cache_path"]).mkdir(
+                        parents=True, exist_ok=True
+                    )
+
         self.session = ort.InferenceSession(str(self.model_path), providers=providers)
         actual_providers = self.session.get_providers()
         print(
             "ONNX Runtime providers (requested -> actual): "
             f"{providers} -> {actual_providers}"
         )
+
+        requested_names = [
+            p[0] if isinstance(p, (list, tuple)) else p for p in providers
+        ]
+        if (
+            "TensorrtExecutionProvider" in requested_names
+            and "TensorrtExecutionProvider" not in actual_providers
+        ):
+            raise RuntimeError(
+                "TensorRT EP was requested but is not active. "
+                f"Requested: {requested_names} | Actual: {actual_providers}"
+            )
         input_meta = self.session.get_inputs()[0]
         self.input_name = input_meta.name
         self.input_size = self._resolve_input_size(input_size)
