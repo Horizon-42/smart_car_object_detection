@@ -225,6 +225,12 @@ def _parse_args() -> argparse.Namespace:
         help="Device for inference.",
     )
     parser.add_argument(
+        "--detections-per-img",
+        type=int,
+        default=0,
+        help="Override max detections per image (0 keeps model default).",
+    )
+    parser.add_argument(
         "--amp",
         action="store_true",
         help="Enable autocast for CUDA inference.",
@@ -268,6 +274,8 @@ def main() -> None:
         state_dict = checkpoint
     model.load_state_dict(state_dict)
     model.to(device)
+    if args.detections_per_img > 0 and hasattr(model, "detections_per_img"):
+        model.detections_per_img = args.detections_per_img
     model.eval()
 
     output_dir: Path | None = None
