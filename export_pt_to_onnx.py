@@ -17,8 +17,8 @@ def _parse_imgsz(value):
 
 def export_pt_to_onnx(
     model_path,
-    imgsz=640,
-    opset=12,
+    imgsz=320,
+    opset=11,
     dynamic=False,
     simplify=False,
     half=False,
@@ -72,10 +72,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--imgsz",
-        default=640,
+        default=320,
         help="Image size (e.g. 640 or 640,480).",
     )
-    parser.add_argument("--opset", type=int, default=12, help="ONNX opset version.")
+    parser.add_argument("--opset", type=int, default=11, help="ONNX opset version.")
     parser.add_argument(
         "--dynamic",
         action="store_true",
@@ -88,6 +88,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--half",
+        default=True,
         action="store_true",
         help="Export with FP16 weights (if supported).",
     )

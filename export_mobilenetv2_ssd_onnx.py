@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 from pathlib import Path
 
 import torch
 
 from train_mobilenetv2_ssd import build_model
+from torchvision.models.detection.image_list import ImageList
 
 
 def _read_lines(path: Path) -> list[str]:
@@ -22,34 +24,75 @@ def _load_class_names(data_root: Path) -> list[str]:
 
 
 class SSDExportWrapper(torch.nn.Module):
-    def __init__(self, model: torch.nn.Module, detections_per_img: int) -> None:
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        image_size: int,
+        detections_per_img: int,
+        use_transform: bool,
+    ) -> None:
         super().__init__()
         self.model = model
+        self.image_size = image_size
         self.detections_per_img = detections_per_img
+        self.use_transform = use_transform
+        self.register_buffer(
+            "_mean",
+            torch.tensor(getattr(model.transform, "image_mean", [0.0, 0.0, 0.0])).view(
+                1, 3, 1, 1
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_std",
+            torch.tensor(getattr(model.transform, "image_std", [1.0, 1.0, 1.0])).view(
+                1, 3, 1, 1
+            ),
+            persistent=False,
+        )
 
     def forward(self, images: torch.Tensor):
         if images.dim() == 3:
             images = images.unsqueeze(0)
-        outputs = self.model(list(images))
-        out = outputs[0]
+        images = images.to(dtype=torch.float32)
+
+        if self.use_transform:
+            outputs = self.model(list(images))
+            out = outputs[0]
+        else:
+            images = (images - self._mean.to(images)) / self._std.to(images)
+            image_sizes = [(self.image_size, self.image_size)] * images.shape[0]
+            image_list = ImageList(images, image_sizes)
+
+            features = self.model.backbone(image_list.tensors)
+            if isinstance(features, torch.Tensor):
+                features = OrderedDict([("0", features)])
+            features_list = list(features.values())
+            head_outputs = self.model.head(features_list)
+            anchors = self.model.anchor_generator(image_list, features_list)
+            detections = self.model.postprocess_detections(
+                head_outputs, anchors, image_list.image_sizes
+            )
+            out = detections[0]
         boxes = out["boxes"]
         scores = out["scores"]
         labels = out["labels"]
 
         max_det = self.detections_per_img
-        count = boxes.shape[0]
-        if count < max_det:
-            pad = max_det - count
-            boxes = torch.cat([boxes, boxes.new_zeros((pad, 4))], dim=0)
-            scores = torch.cat([scores, scores.new_zeros((pad,))], dim=0)
-            labels = torch.cat([
-                labels,
-                labels.new_zeros((pad,), dtype=labels.dtype),
-            ])
-        elif count > max_det:
-            boxes = boxes[:max_det]
-            scores = scores[:max_det]
-            labels = labels[:max_det]
+        if max_det and max_det > 0:
+            count = boxes.shape[0]
+            if count < max_det:
+                pad = max_det - count
+                boxes = torch.cat([boxes, boxes.new_zeros((pad, 4))], dim=0)
+                scores = torch.cat([scores, scores.new_zeros((pad,))], dim=0)
+                labels = torch.cat([
+                    labels,
+                    labels.new_zeros((pad,), dtype=labels.dtype),
+                ])
+            elif count > max_det:
+                boxes = boxes[:max_det]
+                scores = scores[:max_det]
+                labels = labels[:max_det]
 
         return boxes, scores, labels
 
@@ -93,8 +136,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--detections-per-img",
         type=int,
-        default=100,
+        default=0,
         help="Override detections per image (0 keeps model default).",
+    )
+    parser.add_argument(
+        "--use-transform",
+        action="store_true",
+        help="Use the model's internal transform (may add dynamic Pad ops).",
     )
     parser.add_argument(
         "--simplify",
@@ -138,7 +186,12 @@ def main() -> None:
     device = torch.device(args.device)
     model.to(device)
 
-    wrapper = SSDExportWrapper(model, detections_per_img=detections_per_img)
+    wrapper = SSDExportWrapper(
+        model,
+        image_size=args.image_size,
+        detections_per_img=detections_per_img,
+        use_transform=args.use_transform,
+    )
     wrapper.to(device)
     wrapper.eval()
 
