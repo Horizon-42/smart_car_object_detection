@@ -227,6 +227,34 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_model_path(model_arg: str) -> Path:
+    candidate = Path(model_arg).expanduser()
+    if candidate.exists():
+        return candidate.resolve()
+
+    script_dir = Path(__file__).resolve().parent
+    candidates: list[Path] = [
+        script_dir / model_arg,
+        script_dir / "models" / model_arg,
+    ]
+    if candidate.suffix == "":
+        candidates.extend(
+            [
+                script_dir / f"{model_arg}.pt",
+                script_dir / "models" / f"{model_arg}.pt",
+            ]
+        )
+
+    for path in candidates:
+        if path.exists():
+            return path.resolve()
+
+    raise SystemExit(
+        f"Model not found: {model_arg} (checked cwd and {script_dir}/models). "
+        "Please pass a local .pt path to avoid auto-download."
+    )
+
+
 def main() -> None:
     args = _parse_args()
     data_yaml = Path(args.data_yaml).expanduser().resolve()
@@ -285,9 +313,7 @@ def main() -> None:
         print("Ultralytics is required: pip install ultralytics", file=sys.stderr)
         raise SystemExit(1) from exc
 
-    model_path = Path(args.model).resolve()
-    if not model_path.exists():
-        raise SystemExit(f"Model not found: {model_path}")
+    model_path = _resolve_model_path(args.model)
 
     run_name = args.name or f"{model_path.stem}_signs"
     model = YOLO(str(model_path))
@@ -296,15 +322,15 @@ def main() -> None:
         "hsv_s": 0.7,
         "hsv_v": 0.4,
         "degrees": 2.0,
-        "translate": 0.1,
+        "translate": 0.2,
         "scale": 0.5,
         "shear": 2.0,
         "perspective": 0.0005,
         "flipud": 0.0,
         "fliplr": 0.5,
         "mosaic": 1.0,
-        "mixup": 0.1,
-        "copy_paste": 0.1,
+        "mixup": 0.2,
+        "copy_paste": 0.2,
         "erasing": 0.2,
     }
     model.train(

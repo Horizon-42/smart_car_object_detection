@@ -52,10 +52,11 @@ def _load_yolo_model(model_arg):
 
 def _draw_metrics(image, text):
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.6
-    thickness = 2
+    min_dim = min(image.shape[:2])
+    scale = min(1.0, max(0.35, min_dim / 900))
+    thickness = max(1, int(round(scale * 2)))
     (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
-    pad = 6
+    pad = max(3, int(round(scale * 8)))
     x, y = 10, 10 + text_h
     cv2.rectangle(
         image,
@@ -147,7 +148,29 @@ def main():
         if not results:
             continue
         result = results[0]
-        vis = result.plot(line_width=args.line_width)
+        orig = getattr(result, "orig_img", None)
+        if orig is None:
+            orig = cv2.imread(str(img_path))
+        if orig is None:
+            continue
+        min_dim = min(orig.shape[:2])
+        scale = 1.0
+        if min_dim < 480:
+            scale = min(3.0, max(1.5, 480 / min_dim))
+
+        plot_line_width = args.line_width
+        if scale > 1.0:
+            plot_line_width = max(1, int(round(args.line_width / scale)))
+
+        vis = result.plot(line_width=plot_line_width)
+        if scale > 1.0:
+            vis = cv2.resize(
+                vis,
+                dsize=None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_LINEAR,
+            )
 
         inf_ms = elapsed * 1000.0
         fps = 1.0 / elapsed if elapsed > 0 else float("inf")
