@@ -15,16 +15,232 @@ except Exception as exc:  # pragma: no cover - runtime dependency
 else:
     _TRT_IMPORT_ERROR = None
 
-from onnx_detector import (
-    IMAGE_EXTS,
-    _decode_predictions,
-    _letterbox,
-    _nms,
-    _normalize_output,
-    _scale_boxes,
-    draw_detections,
-    load_class_names,
-)
+PALETTE = [
+    (255, 82, 82),
+    (0, 189, 214),
+    (65, 179, 123),
+    (255, 196, 0),
+    (146, 104, 255),
+    (255, 112, 67),
+    (38, 198, 218),
+    (156, 204, 101),
+    (171, 71, 188),
+    (66, 165, 245),
+]
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
+
+
+def load_class_names(source=None):
+    if source is None:
+        return []
+    if isinstance(source, (list, tuple)):
+        return list(source)
+    path = Path(source)
+    if not path.exists():
+        return []
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _color_for_class(class_id):
+    return PALETTE[class_id % len(PALETTE)]
+
+
+def _text_color_for_bg(bgr):
+    b, g, r = bgr
+    luminance = 0.114 * b + 0.587 * g + 0.299 * r
+    return (0, 0, 0) if luminance > 140 else (255, 255, 255)
+
+
+def _draw_text_with_bg(image, text, origin, bg_color, font_scale, thickness):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    x, y = origin
+    x = max(0, min(x, image.shape[1] - text_w - 1))
+    y = max(text_h + baseline + 1, min(y, image.shape[0] - 1))
+    top_left = (x, y - text_h - baseline - 1)
+    bottom_right = (x + text_w + 2, y + baseline + 1)
+    cv2.rectangle(image, top_left, bottom_right, bg_color, -1)
+    text_color = _text_color_for_bg(bg_color)
+    cv2.putText(
+        image,
+        text,
+        (x + 1, y - 1),
+        font,
+        font_scale,
+        text_color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def _letterbox(image, new_shape, color=(114, 114, 114)):
+    shape = image.shape[:2]  # h, w
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
+
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))  # w, h
+    dw = new_shape[1] - new_unpad[0]
+    dh = new_shape[0] - new_unpad[1]
+    dw /= 2
+    dh /= 2
+
+    resized = cv2.resize(image, new_unpad, interpolation=cv2.INTER_LINEAR)
+    top = int(round(dh - 0.1))
+    bottom = int(round(dh + 0.1))
+    left = int(round(dw - 0.1))
+    right = int(round(dw + 0.1))
+
+    out = cv2.copyMakeBorder(
+        resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color
+    )
+    return out, r, (left, top)
+
+
+def _xywh_to_xyxy(xywh):
+    xyxy = xywh.copy()
+    xyxy[:, 0] = xywh[:, 0] - xywh[:, 2] / 2
+    xyxy[:, 1] = xywh[:, 1] - xywh[:, 3] / 2
+    xyxy[:, 2] = xywh[:, 0] + xywh[:, 2] / 2
+    xyxy[:, 3] = xywh[:, 1] + xywh[:, 3] / 2
+    return xyxy
+
+
+def _clip_boxes(boxes, shape):
+    h, w = shape[:2]
+    boxes[:, 0] = np.clip(boxes[:, 0], 0, w - 1)
+    boxes[:, 1] = np.clip(boxes[:, 1], 0, h - 1)
+    boxes[:, 2] = np.clip(boxes[:, 2], 0, w - 1)
+    boxes[:, 3] = np.clip(boxes[:, 3], 0, h - 1)
+    return boxes
+
+
+def _scale_boxes(boxes, ratio, pad, shape):
+    boxes[:, [0, 2]] -= pad[0]
+    boxes[:, [1, 3]] -= pad[1]
+    boxes[:, :4] /= ratio
+    return _clip_boxes(boxes, shape)
+
+
+def _nms(boxes, scores, iou_thres):
+    if len(boxes) == 0:
+        return []
+    boxes = boxes.astype(np.float32)
+    scores = scores.astype(np.float32)
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+
+    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+    order = scores.argsort()[::-1]
+    keep = []
+
+    while order.size > 0:
+        i = order[0]
+        keep.append(int(i))
+        if order.size == 1:
+            break
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+
+        w = np.maximum(0.0, xx2 - xx1 + 1)
+        h = np.maximum(0.0, yy2 - yy1 + 1)
+        inter = w * h
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
+
+        remaining = np.where(iou <= iou_thres)[0]
+        order = order[remaining + 1]
+    return keep
+
+
+def _normalize_output(outputs):
+    if isinstance(outputs, (list, tuple)):
+        output = outputs[0]
+    else:
+        output = outputs
+
+    output = np.asarray(output)
+    if output.ndim == 3:
+        if output.shape[1] < output.shape[2]:
+            output = np.transpose(output, (0, 2, 1))
+        output = output[0]
+    elif output.ndim == 2:
+        output = output
+    else:
+        output = output.reshape(-1, output.shape[-1])
+    return output
+
+
+def _decode_predictions(preds, conf_thres, num_classes=None, box_format="auto"):
+    if preds.size == 0:
+        return np.zeros((0, 4)), np.zeros((0,)), np.zeros((0,), dtype=int)
+
+    dim = preds.shape[1]
+
+    if dim in (6, 7):
+        coords = preds[:, :4]
+        scores = preds[:, 4]
+        class_ids = preds[:, 5].astype(int)
+        if box_format == "xywh":
+            coords = _xywh_to_xyxy(coords)
+    else:
+        coords = preds[:, :4]
+        scores_raw = preds[:, 4:]
+        if num_classes is not None:
+            if dim == 4 + num_classes:
+                scores = scores_raw[:, :num_classes]
+            elif dim >= 5 + num_classes:
+                obj = scores_raw[:, 0:1]
+                scores = obj * scores_raw[:, 1 : 1 + num_classes]
+            else:
+                scores = scores_raw
+        else:
+            if dim >= 5 and scores_raw.shape[1] >= 2:
+                obj = scores_raw[:, 0:1]
+                scores = obj * scores_raw[:, 1:]
+            else:
+                scores = scores_raw
+
+        class_ids = scores.argmax(axis=1)
+        scores = scores.max(axis=1)
+
+        if box_format in ("auto", "xywh"):
+            coords = _xywh_to_xyxy(coords)
+
+    mask = scores >= conf_thres
+    return coords[mask], scores[mask], class_ids[mask]
+
+
+def draw_detections(image_bgr, detections, class_names=None):
+    output = image_bgr.copy()
+    h, w = output.shape[:2]
+    thickness = max(1, int(round(min(h, w) / 400)))
+    font_scale = max(0.5, min(h, w) / 1200)
+
+    for det in detections:
+        x1, y1, x2, y2 = [int(round(v)) for v in det["box"]]
+        conf = det["conf"]
+        class_id = det["class_id"]
+
+        color = _color_for_class(class_id)
+        cv2.rectangle(output, (x1, y1), (x2, y2), color, thickness)
+        name = (
+            class_names[class_id]
+            if class_names and 0 <= class_id < len(class_names)
+            else f"class_{class_id}"
+        )
+        label_text = f"{name} {conf:.2f}"
+        _draw_text_with_bg(output, label_text, (x1, y1 - 4), color, font_scale, thickness)
+
+    return output
 
 
 def parse_imgsz(value):

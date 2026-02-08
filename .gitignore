@@ -3,3 +3,4 @@ test_images
 __pycache__
 
 finetune_dataset
+original_dataset
