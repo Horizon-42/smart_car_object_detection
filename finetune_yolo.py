@@ -2,192 +2,151 @@ from __future__ import annotations
 
 import argparse
 import random
-import shutil
 import sys
 from pathlib import Path
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
-
-def _collect_images(images_dir: Path) -> list[Path]:
-    return [p for p in sorted(images_dir.iterdir()) if p.suffix.lower() in IMAGE_EXTS]
-
-
-def _load_class_names(data_dir: Path) -> list[str]:
-    classes_path = data_dir / "classes.txt"
+def _parse_data_yaml(data_yaml: Path) -> dict[str, str]:
     try:
-        content = classes_path.read_text(encoding="utf-8")
-    except OSError:
-        return []
-    return [line.strip() for line in content.splitlines() if line.strip()]
+        content = data_yaml.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"Unable to read data.yaml: {data_yaml}") from exc
 
-
-def _has_label(labels_dir: Path, image_path: Path) -> bool:
-    return (labels_dir / f"{image_path.stem}.txt").exists()
-
-
-def _sanitize_label_file(label_path: Path) -> list[str]:
-    try:
-        content = label_path.read_text(encoding="utf-8")
-    except OSError:
-        return []
-    cleaned: list[str] = []
+    data: dict[str, str] = {}
     for line in content.splitlines():
-        parts = line.strip().split()
-        if len(parts) < 5:
+        if not line.strip():
             continue
-        try:
-            class_id = int(float(parts[0]))
-            x_center = float(parts[1])
-            y_center = float(parts[2])
-            width = float(parts[3])
-            height = float(parts[4])
-        except ValueError:
+        if line.lstrip().startswith("#"):
             continue
-        cleaned.append(
-            f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
-        )
-    return cleaned
+        if line[:1].isspace():
+            continue
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if key not in {"path", "train", "val", "test"}:
+            continue
+        value = value.split("#", 1)[0].strip()
+        data[key] = value
+
+    missing = [k for k in ("path", "train", "val") if k not in data]
+    if missing:
+        raise SystemExit(f"data.yaml missing keys: {', '.join(missing)}")
+    return data
 
 
-def _ensure_images_dir(src_images: Path, dst_images: Path, copy_images: bool) -> None:
-    if dst_images.exists():
-        return
-    if copy_images:
-        dst_images.mkdir(parents=True, exist_ok=True)
-        for image in _collect_images(src_images):
-            shutil.copy2(image, dst_images / image.name)
-        return
+def _resolve_data_root(data_yaml: Path, root_entry: str) -> Path:
+    root_path = Path(root_entry).expanduser()
+    if not root_path.is_absolute():
+        root_path = (data_yaml.parent / root_path).resolve()
+    return root_path
+
+
+def _resolve_list_path(data_root: Path, entry: str) -> Path:
+    list_path = Path(entry).expanduser()
+    if not list_path.is_absolute():
+        list_path = (data_root / list_path).resolve()
+    return list_path
+
+
+def _load_train_images(train_list_path: Path, data_root: Path) -> list[Path]:
     try:
-        dst_images.symlink_to(src_images, target_is_directory=True)
-    except OSError:
-        dst_images.mkdir(parents=True, exist_ok=True)
-        for image in _collect_images(src_images):
-            shutil.copy2(image, dst_images / image.name)
+        content = train_list_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"Unable to read train list: {train_list_path}") from exc
+
+    images: list[Path] = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        image_path = Path(line)
+        if not image_path.is_absolute():
+            image_path = (data_root / image_path).resolve()
+        images.append(image_path)
+    if not images:
+        raise SystemExit(f"No training images listed in {train_list_path}")
+    return images
 
 
-def _write_list(path: Path, items: list[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(items), encoding="utf-8")
+def _collect_class_images(
+    train_images: list[Path], labels_dir: Path
+) -> dict[int, list[Path]]:
+    class_to_images: dict[int, list[Path]] = {}
+    for image_path in train_images:
+        label_path = labels_dir / f"{image_path.stem}.txt"
+        try:
+            content = label_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        class_ids: set[int] = set()
+        for line in content.splitlines():
+            parts = line.strip().split()
+            if not parts:
+                continue
+            try:
+                class_id = int(float(parts[0]))
+            except ValueError:
+                continue
+            class_ids.add(class_id)
+        for class_id in class_ids:
+            class_to_images.setdefault(class_id, []).append(image_path)
+    return class_to_images
 
 
-def _check_leak(train: list[str], val: list[str], test: list[str]) -> None:
-    train_set = set(train)
-    val_set = set(val)
-    test_set = set(test)
-
-    overlap_train_val = train_set & val_set
-    overlap_train_test = train_set & test_set
-    overlap_val_test = val_set & test_set
-
-    if overlap_train_val or overlap_train_test or overlap_val_test:
-        print("Data leak detected between splits:")
-        if overlap_train_val:
-            print(f"  Train ∩ Val: {len(overlap_train_val)}")
-        if overlap_train_test:
-            print(f"  Train ∩ Test: {len(overlap_train_test)}")
-        if overlap_val_test:
-            print(f"  Val ∩ Test: {len(overlap_val_test)}")
-        sys.exit(1)
-
-
-def split_dataset(
-    image_names: list[str],
-    ratios: tuple[float, float, float],
-    seed: int,
-    data_root: Path,
-    splits_dir: Path,
-) -> tuple[Path, Path, Path, Path]:
-    if not image_names:
-        raise RuntimeError("No images available for splitting.")
-
+def _build_balanced_train_list(
+    class_to_images: dict[int, list[Path]], seed: int
+) -> list[Path]:
+    if not class_to_images:
+        return []
+    max_len = max(len(images) for images in class_to_images.values() if images)
+    if max_len == 0:
+        return []
     rng = random.Random(seed)
-    rng.shuffle(image_names)
+    balanced: list[Path] = []
+    for class_id in sorted(class_to_images):
+        images = class_to_images[class_id]
+        if not images:
+            continue
+        if len(images) < max_len:
+            images = images + [rng.choice(images) for _ in range(max_len - len(images))]
+        balanced.extend(images)
+    rng.shuffle(balanced)
+    return balanced
 
-    train_ratio, val_ratio, test_ratio = ratios
-    n_total = len(image_names)
-    n_train = int(n_total * train_ratio)
-    n_val = int(n_total * val_ratio)
-    n_test = n_total - n_train - n_val
 
-    if n_train == 0 or n_val == 0 or n_test == 0:
-        print(
-            "Warning: one of the splits is empty. "
-            "Adjust ratios or ensure more data."
-        )
-
-    train_imgs = image_names[:n_train]
-    val_imgs = image_names[n_train : n_train + n_val]
-    test_imgs = image_names[n_train + n_val :]
-
-    # Use absolute paths so Ultralytics resolves images/labels correctly.
-    images_root = data_root / "images"
-    train_list = [str((images_root / name).resolve()) for name in train_imgs]
-    val_list = [str((images_root / name).resolve()) for name in val_imgs]
-    test_list = [str((images_root / name).resolve()) for name in test_imgs]
-
-    _check_leak(train_list, val_list, test_list)
-
-    train_txt = splits_dir / "train.txt"
-    val_txt = splits_dir / "val.txt"
-    test_txt = splits_dir / "test.txt"
-    _write_list(train_txt, train_list)
-    _write_list(val_txt, val_list)
-    _write_list(test_txt, test_list)
-
-    data_yaml = splits_dir / "data.yaml"
-    names = _load_class_names(data_root)
-    yaml_lines = [
-        f"path: {data_root}",
-        f"train: {train_txt.relative_to(data_root)}",
-        f"val: {val_txt.relative_to(data_root)}",
-        f"test: {test_txt.relative_to(data_root)}",
-    ]
-    if names:
-        yaml_lines.append("names:")
-        yaml_lines.extend([f"  {idx}: {name}" for idx, name in enumerate(names)])
-    else:
-        yaml_lines.append("names: []")
-    data_yaml.write_text("\n".join(yaml_lines), encoding="utf-8")
-
-    print(f"Total labeled images: {n_total}")
-    print(f"Train: {len(train_list)}  Val: {len(val_list)}  Test: {len(test_list)}")
-    print(f"Splits written to: {splits_dir}")
-
-    return train_txt, val_txt, test_txt, data_yaml
+def _write_balanced_data_yaml(
+    src_yaml: Path, dst_yaml: Path, train_entry: str
+) -> None:
+    content = src_yaml.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    new_lines: list[str] = []
+    replaced = False
+    for line in lines:
+        if line[:1].isspace():
+            new_lines.append(line)
+            continue
+        if line.lstrip().startswith("#"):
+            new_lines.append(line)
+            continue
+        if line.strip().startswith("train:"):
+            new_lines.append(f"train: {train_entry}")
+            replaced = True
+        else:
+            new_lines.append(line)
+    if not replaced:
+        new_lines.append(f"train: {train_entry}")
+    dst_yaml.write_text("\n".join(new_lines), encoding="utf-8")
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Split dataset, check data leak, and finetune a YOLO model using Ultralytics."
-        )
+        description="Finetune a YOLO model using Ultralytics."
     )
     parser.add_argument(
-        "--data",
-        default="finetune_dataset",
-        help="Dataset directory containing images/ and labels/",
-    )
-    parser.add_argument(
-        "--ratios",
-        default="0.7,0.2,0.1",
-        help="Train/val/test ratios, e.g. 0.7,0.2,0.1",
-    )
-    parser.add_argument(
-        "--finetune-dir",
-        default="finetune_dataset",
-        help="Directory to write sanitized labels and splits (relative to data dir).",
-    )
-    parser.add_argument(
-        "--copy-images",
-        action="store_true",
-        help="Copy images into the finetune dataset instead of symlinking.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for split.",
+        "--data-yaml",
+        default="finetune_dataset/splits/data.yaml",
+        help="Path to data.yaml produced by split_dataset_cli.py.",
     )
     parser.add_argument(
         "--model",
@@ -209,8 +168,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch",
         type=int,
-        default=16,
+        default=32,
         help="Batch size.",
+    )
+    parser.add_argument(
+        "--balance-seed",
+        type=int,
+        default=42,
+        help="Random seed for class-balanced resampling.",
     )
     parser.add_argument(
         "--project",
@@ -222,83 +187,41 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Run name (defaults to <model-stem>_signs).",
     )
-    parser.add_argument(
-        "--no-train",
-        action="store_true",
-        help="Only create splits and check leak, skip training.",
-    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    data_dir = Path(args.data).resolve()
+    data_yaml = Path(args.data_yaml).expanduser().resolve()
+    if not data_yaml.exists():
+        raise SystemExit(f"data.yaml not found: {data_yaml}")
 
-    try:
-        ratios = tuple(float(x.strip()) for x in args.ratios.split(","))
-    except ValueError:
-        raise SystemExit("Invalid ratios format. Use something like 0.7,0.2,0.1")
-
-    if len(ratios) != 3:
-        raise SystemExit("Ratios must have three values (train,val,test).")
-    if any(r < 0 for r in ratios):
-        raise SystemExit("Ratios must be non-negative.")
-    if abs(sum(ratios) - 1.0) > 1e-6:
-        raise SystemExit("Ratios must sum to 1.0")
-
-    finetune_dir = Path(args.finetune_dir).expanduser()
-    if not finetune_dir.is_absolute():
-        finetune_dir = data_dir / finetune_dir
-    finetune_dir = finetune_dir.resolve()
-
-    images_dir = data_dir / "images"
-    labels_dir = data_dir / "labels"
-    if not images_dir.is_dir():
-        raise SystemExit(f"Images directory not found: {images_dir}")
+    data_cfg = _parse_data_yaml(data_yaml)
+    data_root = _resolve_data_root(data_yaml, data_cfg["path"])
+    train_list_path = _resolve_list_path(data_root, data_cfg["train"])
+    labels_dir = data_root / "labels"
     if not labels_dir.is_dir():
         raise SystemExit(f"Labels directory not found: {labels_dir}")
 
-    finetune_images_dir = finetune_dir / "images"
-    finetune_labels_dir = finetune_dir / "labels"
-    _ensure_images_dir(images_dir, finetune_images_dir, args.copy_images)
-    finetune_labels_dir.mkdir(parents=True, exist_ok=True)
-    classes_src = data_dir / "classes.txt"
-    classes_dst = finetune_dir / "classes.txt"
-    if classes_src.exists() and not classes_dst.exists():
-        shutil.copy2(classes_src, classes_dst)
-
-    images = _collect_images(images_dir)
-    if not images:
-        raise SystemExit(f"No images found in {images_dir}")
-
-    labeled_images = [img for img in images if _has_label(labels_dir, img)]
-    if not labeled_images:
-        raise SystemExit("No labeled images found (missing label files).")
-
-    image_names: list[str] = []
-    total_label_lines = 0
-    for image_path in labeled_images:
-        src_label = labels_dir / f"{image_path.stem}.txt"
-        cleaned_lines = _sanitize_label_file(src_label)
-        total_label_lines += len(cleaned_lines)
-        dst_label = finetune_labels_dir / f"{image_path.stem}.txt"
-        dst_label.write_text("\n".join(cleaned_lines), encoding="utf-8")
-        image_names.append(image_path.name)
-
-    if total_label_lines == 0:
-        raise SystemExit(
-            "No valid labels found after sanitization. "
-            "If your labels include a confidence column, this script removes it, "
-            "but invalid rows are discarded."
-        )
-
-    splits_dir = finetune_dir / "splits"
-    _, _, _, data_yaml = split_dataset(
-        image_names, ratios, args.seed, finetune_dir, splits_dir
+    train_images = _load_train_images(train_list_path, data_root)
+    class_to_images = _collect_class_images(train_images, labels_dir)
+    balanced_images = _build_balanced_train_list(
+        class_to_images, args.balance_seed
     )
+    if not balanced_images:
+        raise SystemExit("Unable to build a balanced training list (no labels found).")
 
-    if args.no_train:
-        return
+    balanced_train_path = train_list_path.with_name("train_balanced.txt")
+    balanced_train_path.write_text(
+        "\n".join(str(path) for path in balanced_images), encoding="utf-8"
+    )
+    try:
+        balanced_train_entry = str(balanced_train_path.relative_to(data_root))
+    except ValueError:
+        balanced_train_entry = str(balanced_train_path)
+
+    balanced_data_yaml = data_yaml.with_name("data_balanced.yaml")
+    _write_balanced_data_yaml(data_yaml, balanced_data_yaml, balanced_train_entry)
 
     try:
         from ultralytics import YOLO
@@ -312,13 +235,30 @@ def main() -> None:
 
     run_name = args.name or f"{model_path.stem}_signs"
     model = YOLO(str(model_path))
+    augment_args = {
+        "hsv_h": 0.015,
+        "hsv_s": 0.7,
+        "hsv_v": 0.4,
+        "degrees": 2.0,
+        "translate": 0.1,
+        "scale": 0.5,
+        "shear": 2.0,
+        "perspective": 0.0005,
+        "flipud": 0.0,
+        "fliplr": 0.5,
+        "mosaic": 1.0,
+        "mixup": 0.1,
+        "copy_paste": 0.1,
+        "erasing": 0.2,
+    }
     model.train(
-        data=str(data_yaml),
+        data=str(balanced_data_yaml),
         epochs=args.epochs,
         imgsz=args.imgsz,
         batch=args.batch,
         project=args.project,
         name=run_name,
+        **augment_args,
     )
 
 
